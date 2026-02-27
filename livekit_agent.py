@@ -68,10 +68,11 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add avg_latency_ms column if table already exists without it
+        # Add columns if table already exists without them
         cur.execute("""
             DO $$ BEGIN
                 ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS avg_latency_ms FLOAT;
+                ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS latency_metrics JSONB;
             EXCEPTION WHEN others THEN NULL;
             END $$;
         """)
@@ -85,7 +86,7 @@ def init_database():
         return False
 
 
-def save_call_to_db(call_id, start_time, duration, summary, transcript, count, avg_latency_ms=None):
+def save_call_to_db(call_id, start_time, duration, summary, transcript, count, avg_latency_ms=None, latency_metrics=None):
     if not DATABASE_URL:
         return False
     try:
@@ -93,8 +94,8 @@ def save_call_to_db(call_id, start_time, duration, summary, transcript, count, a
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO call_logs (call_id, start_time, end_time, duration_seconds, summary, transcript, message_count, avg_latency_ms) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-            (call_id, start_time, datetime.now(), duration, summary, json.dumps(transcript), count, avg_latency_ms)
+            "INSERT INTO call_logs (call_id, start_time, end_time, duration_seconds, summary, transcript, message_count, avg_latency_ms, latency_metrics) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (call_id, start_time, datetime.now(), duration, summary, json.dumps(transcript), count, avg_latency_ms, json.dumps(latency_metrics) if latency_metrics else None)
         )
         conn.commit()
         cur.close()
@@ -114,7 +115,7 @@ def get_call_logs_from_db(limit=10):
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute("""
-            SELECT call_id, start_time, duration_seconds, summary, message_count, avg_latency_ms, created_at
+            SELECT call_id, start_time, duration_seconds, summary, message_count, avg_latency_ms, created_at, latency_metrics
             FROM call_logs ORDER BY created_at DESC LIMIT %s
         """, (limit,))
         rows = cur.fetchall()
@@ -128,6 +129,7 @@ def get_call_logs_from_db(limit=10):
             "message_count": r[4],
             "avg_latency_ms": r[5],
             "created_at": r[6].isoformat() if r[6] else None,
+            "latency_metrics": r[7],
         } for r in rows]
     except Exception as e:
         print(f"DB Read Error: {e}", flush=True)
@@ -348,10 +350,12 @@ async def entrypoint(ctx: JobContext):
         @session.on("user_input_transcribed")
         def on_user(event):
             try:
+                # Skip interim/partial results — only log final transcripts
+                is_final = getattr(event, "is_final", True)
+                if not is_final:
+                    return
+
                 text = getattr(event, "transcript", None) or getattr(event, "text", None)
-                if text is None:
-                    # Try to extract from string representation
-                    text = str(event)
                 if text and isinstance(text, str) and text.strip():
                     last_user_speech_time[0] = time.time()
                     print(f"[User] {text.strip()}", flush=True)
@@ -359,76 +363,79 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 print(f"[Event] user_input_transcribed error: {e}", flush=True)
 
-        # Track AI responses and latency using agent_speech_committed
+        # Helper: record AI response text + latency
+        def _record_ai_response(text, source="agent"):
+            if not text or not text.strip():
+                return False
+            text = text.strip()
+            # Deduplicate — skip if already in recent transcript
+            if any(t[1] == text for t in transcript[-5:] if t[0] == "AI"):
+                return False
+            if last_user_speech_time[0] is not None:
+                latency_ms = (time.time() - last_user_speech_time[0]) * 1000
+                latency_values.append(latency_ms)
+                print(f"[AI] {text}  (latency: {latency_ms:.0f}ms) [{source}]", flush=True)
+                last_user_speech_time[0] = None
+            else:
+                print(f"[AI] {text} [{source}]", flush=True)
+            transcript.append(("AI", text))
+            return True
+
+        # Helper: extract text from an event/item trying multiple attribute patterns
+        def _extract_text(obj):
+            # Direct string attributes
+            for attr in ["content", "text", "transcript", "message", "speech"]:
+                val = getattr(obj, attr, None)
+                if val and isinstance(val, str) and val.strip():
+                    return val.strip()
+            # Nested content list (e.g., list of ContentPart objects)
+            content = getattr(obj, "content", None)
+            if isinstance(content, list):
+                for cp in content:
+                    for attr in ["text", "content"]:
+                        t = getattr(cp, attr, None)
+                        if t and isinstance(t, str) and t.strip():
+                            return t.strip()
+            # Try .item sub-object
+            item = getattr(obj, "item", None)
+            if item and item is not obj:
+                return _extract_text(item)
+            return None
+
+        # Primary: agent_speech_committed
         @session.on("agent_speech_committed")
         def on_agent_speech(event):
             try:
-                # Try multiple ways to extract text from the event
-                text = None
-                for attr in ["content", "text", "transcript", "message"]:
-                    val = getattr(event, attr, None)
-                    if val and isinstance(val, str):
-                        text = val
-                        break
-
-                # If it's a complex object, try nested access
-                if text is None and hasattr(event, "content"):
-                    content = event.content
-                    if isinstance(content, list):
-                        for cp in content:
-                            if hasattr(cp, "text") and cp.text:
-                                text = cp.text
-                                break
-                    elif isinstance(content, str):
-                        text = content
-
-                if text and text.strip():
-                    if last_user_speech_time[0] is not None:
-                        latency_ms = (time.time() - last_user_speech_time[0]) * 1000
-                        latency_values.append(latency_ms)
-                        print(f"[AI] {text.strip()}  (latency: {latency_ms:.0f}ms)", flush=True)
-                        last_user_speech_time[0] = None
-                    else:
-                        print(f"[AI] {text.strip()}", flush=True)
-                    transcript.append(("AI", text.strip()))
+                text = _extract_text(event)
+                if text:
+                    _record_ai_response(text, source="speech_committed")
                 else:
-                    # Log the raw event so we can see its structure
-                    print(f"[AI-Event] agent_speech_committed: {type(event).__name__} attrs={[a for a in dir(event) if not a.startswith('_')]}", flush=True)
+                    # Log full event structure for debugging
+                    attrs = {}
+                    for a in dir(event):
+                        if not a.startswith('_'):
+                            try:
+                                v = getattr(event, a)
+                                if not callable(v):
+                                    attrs[a] = f"{type(v).__name__}={repr(v)[:80]}"
+                            except:
+                                pass
+                    print(f"[DEBUG] agent_speech_committed no text: {type(event).__name__} {attrs}", flush=True)
             except Exception as e:
                 print(f"[Event] agent_speech_committed error: {e}", flush=True)
 
-        # Also try conversation_item_added as fallback
+        # Fallback: conversation_item_added
         @session.on("conversation_item_added")
         def on_conversation_item(event):
             try:
                 item = getattr(event, "item", event)
                 role = getattr(item, "role", None)
-                if role != "assistant":
+                # Accept both "assistant" and "agent" roles
+                if role not in ("assistant", "agent"):
                     return
-
-                text = None
-                content = getattr(item, "content", None)
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for cp in content:
-                        t = getattr(cp, "text", None)
-                        if t:
-                            text = t
-                            break
-
-                if text and text.strip():
-                    # Only log if not already captured by agent_speech_committed
-                    already_logged = any(t[1] == text.strip() for t in transcript[-3:] if t[0] == "AI")
-                    if not already_logged:
-                        if last_user_speech_time[0] is not None:
-                            latency_ms = (time.time() - last_user_speech_time[0]) * 1000
-                            latency_values.append(latency_ms)
-                            print(f"[AI] {text.strip()}  (latency: {latency_ms:.0f}ms)", flush=True)
-                            last_user_speech_time[0] = None
-                        else:
-                            print(f"[AI] {text.strip()}", flush=True)
-                        transcript.append(("AI", text.strip()))
+                text = _extract_text(item)
+                if text:
+                    _record_ai_response(text, source="conv_item")
             except Exception as e:
                 print(f"[Event] conversation_item_added error: {e}", flush=True)
 
@@ -472,6 +479,26 @@ def _save_call_sync(call_id, call_start, transcript, latency_values):
     avg_latency = round(sum(latency_values) / len(latency_values), 1) if latency_values else None
     duration = (datetime.now() - call_start).total_seconds()
 
+    # Build per-turn latency_metrics (similar to Pipecat format)
+    latency_metrics = None
+    if latency_values:
+        turns = []
+        for i, lat in enumerate(latency_values):
+            turns.append({
+                "turn": i + 1,
+                "total_ms": round(lat, 1),
+                "time_to_first_audio_ms": round(lat, 1),  # best approximation with LiveKit SDK
+            })
+        latency_metrics = {
+            "turns": turns,
+            "averages": {
+                "total_ms": round(sum(latency_values) / len(latency_values), 1),
+                "time_to_first_audio_ms": round(sum(latency_values) / len(latency_values), 1),
+            },
+            "total_turns": len(latency_values),
+            "note": "LiveKit SDK abstracts STT/LLM/TTS pipeline; total_ms = time from user speech end to AI speech start"
+        }
+
     print(f"\n{'='*50}", flush=True)
     print(f"CALL ENDED: {call_id}", flush=True)
     print(f"Duration: {duration:.1f}s | Messages: {len(transcript)}", flush=True)
@@ -501,7 +528,7 @@ def _save_call_sync(call_id, call_start, transcript, latency_values):
             print(f"Summary generation error: {e}", flush=True)
 
     print(f"Summary: {summary}", flush=True)
-    saved = save_call_to_db(call_id, call_start, duration, summary, transcript, len(transcript), avg_latency)
+    saved = save_call_to_db(call_id, call_start, duration, summary, transcript, len(transcript), avg_latency, latency_metrics)
     print(f"Saved to DB: {'Yes' if saved else 'No'}", flush=True)
     print(f"{'='*50}\n", flush=True)
 
