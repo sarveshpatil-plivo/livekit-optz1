@@ -328,6 +328,7 @@ async def entrypoint(ctx: JobContext):
     transcript = []
     latency_values = []
     last_user_speech_time = [None]
+    session = None  # keep reference for chat_ctx extraction in finally
 
     # Disconnect event — shared with end_call tool
     disconnect_event = asyncio.Event()
@@ -494,6 +495,47 @@ async def entrypoint(ctx: JobContext):
 
     finally:
         _call_disconnect_event = None
+
+        # Fallback: extract transcript from session's chat context if event handlers missed AI responses
+        if session is not None:
+            try:
+                chat_ctx = getattr(session, "chat_ctx", None)
+                if chat_ctx:
+                    items = getattr(chat_ctx, "items", None) or getattr(chat_ctx, "messages", None) or []
+                    session_transcript = []
+                    for item in items:
+                        role = getattr(item, "role", None)
+                        if role == "system":
+                            continue
+                        # Extract text from content (may be str or list of content parts)
+                        content = getattr(item, "content", None)
+                        text = None
+                        if isinstance(content, str) and content.strip():
+                            text = content.strip()
+                        elif isinstance(content, list):
+                            parts = []
+                            for cp in content:
+                                t = getattr(cp, "text", None) or getattr(cp, "content", None)
+                                if t and isinstance(t, str):
+                                    parts.append(t.strip())
+                            text = " ".join(parts) if parts else None
+                        if text:
+                            speaker = "AI" if role in ("assistant", "agent") else "User"
+                            session_transcript.append((speaker, text))
+
+                    ai_from_events = sum(1 for t in transcript if t[0] == "AI")
+                    ai_from_session = sum(1 for t in session_transcript if t[0] == "AI")
+                    print(f"[Agent] Transcript comparison: events={len(transcript)} ({ai_from_events} AI), chat_ctx={len(session_transcript)} ({ai_from_session} AI)", flush=True)
+
+                    # Use session transcript if it captured more AI responses
+                    if ai_from_session > ai_from_events and len(session_transcript) > 0:
+                        print(f"[Agent] Using chat_ctx transcript (has {ai_from_session} AI responses vs {ai_from_events} from events)", flush=True)
+                        transcript = session_transcript
+                else:
+                    print("[Agent] No chat_ctx found on session", flush=True)
+            except Exception as e:
+                print(f"[Agent] chat_ctx extraction failed: {e}", flush=True)
+
         print(f"[Agent] Saving call data ({len(transcript)} messages, {len(latency_values)} latency samples)...", flush=True)
         _save_call_sync(call_id, call_start, transcript, latency_values)
 
