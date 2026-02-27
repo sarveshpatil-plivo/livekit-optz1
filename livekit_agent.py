@@ -341,16 +341,30 @@ async def entrypoint(ctx: JobContext):
         print(f"[Agent] Participant joined: {call_id}", flush=True)
 
         # Use Groq for fast LLM inference (~300ms first token), fall back to GPT-4o-mini
+        active_llm = None
         if GROQ_API_KEY:
-            active_llm = openai.LLM(
-                model="llama-3.3-70b-versatile",
-                base_url="https://api.groq.com/openai/v1",
-                api_key=GROQ_API_KEY,
-            )
-            print("[Agent] LLM: Groq llama-3.3-70b-versatile", flush=True)
-        else:
+            # Try with_groq() class method (livekit-plugins-openai v1.4+)
+            try:
+                active_llm = openai.LLM.with_groq(
+                    model="llama-3.3-70b-versatile",
+                    api_key=GROQ_API_KEY,
+                )
+                print("[Agent] LLM: Groq llama-3.3-70b-versatile (via with_groq)", flush=True)
+            except (AttributeError, TypeError) as e:
+                print(f"[Agent] with_groq() not available ({e}), trying base_url...", flush=True)
+                try:
+                    active_llm = openai.LLM(
+                        model="llama-3.3-70b-versatile",
+                        base_url="https://api.groq.com/openai/v1",
+                        api_key=GROQ_API_KEY,
+                    )
+                    print("[Agent] LLM: Groq llama-3.3-70b-versatile (via base_url)", flush=True)
+                except Exception as e2:
+                    print(f"[Agent] Groq base_url failed ({e2}), falling back to GPT-4o-mini", flush=True)
+                    active_llm = None
+        if active_llm is None:
             active_llm = openai.LLM(model="gpt-4o-mini")
-            print("[Agent] LLM: GPT-4o-mini (set GROQ_API_KEY for faster inference)", flush=True)
+            print("[Agent] LLM: GPT-4o-mini", flush=True)
 
         session = AgentSession(
             vad=ctx.proc.userdata["vad"],
