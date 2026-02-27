@@ -4,7 +4,7 @@ Connects Plivo phone calls to an AI voice bot via LiveKit SIP.
 
 Features:
 - Deepgram Nova-2 STT + Aura TTS
-- GPT-4o-mini LLM with function calling
+- Groq LLM (fast inference) with function calling, GPT-4o-mini fallback
 - Per-turn latency tracking (saved to DB)
 - PostgreSQL call logging with AI summaries
 - Correct <User> SIP tag for Plivo forwarding
@@ -38,6 +38,7 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -339,10 +340,22 @@ async def entrypoint(ctx: JobContext):
         call_id = participant.identity or "unknown"
         print(f"[Agent] Participant joined: {call_id}", flush=True)
 
+        # Use Groq for fast LLM inference (~300ms first token), fall back to GPT-4o-mini
+        if GROQ_API_KEY:
+            active_llm = openai.LLM(
+                model="llama-3.3-70b-versatile",
+                base_url="https://api.groq.com/openai/v1",
+                api_key=GROQ_API_KEY,
+            )
+            print("[Agent] LLM: Groq llama-3.3-70b-versatile", flush=True)
+        else:
+            active_llm = openai.LLM(model="gpt-4o-mini")
+            print("[Agent] LLM: GPT-4o-mini (set GROQ_API_KEY for faster inference)", flush=True)
+
         session = AgentSession(
             vad=ctx.proc.userdata["vad"],
             stt=deepgram.STT(model="nova-2"),
-            llm=openai.LLM(model="gpt-4o-mini"),
+            llm=active_llm,
             tts=deepgram.TTS(model="aura-asteria-en"),
         )
 
@@ -548,7 +561,7 @@ def create_app():
             "service": "TechCorp Voice AI (LiveKit)",
             "stt": "deepgram-nova-2",
             "tts": "deepgram-aura",
-            "llm": "gpt-4o-mini",
+            "llm": "groq-llama-3.3-70b" if GROQ_API_KEY else "gpt-4o-mini",
             "sip_configured": bool(LIVEKIT_SIP_URI),
         }
 
