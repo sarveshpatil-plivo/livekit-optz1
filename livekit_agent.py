@@ -381,7 +381,21 @@ async def entrypoint(ctx: JobContext):
             tts=deepgram.TTS(model="aura-asteria-en"),
         )
 
-        # Track user speech transcripts
+        # ---- Deduplication helper for AI response capture ----
+        _last_ai_text = [None]
+
+        def _record_ai_response(text):
+            """Add AI response to transcript with deduplication."""
+            if not text or not text.strip():
+                return
+            text = text.strip()
+            if text == _last_ai_text[0]:
+                return  # duplicate
+            _last_ai_text[0] = text
+            print(f"[AI] {text}", flush=True)
+            transcript.append(("AI", text))
+
+        # ---- Track user speech transcripts ----
         @session.on("user_input_transcribed")
         def on_user(event):
             try:
@@ -396,7 +410,39 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 print(f"[Event] user_input_transcribed error: {e}", flush=True)
 
-        # Collect per-component metrics from SDK (STT, LLM, TTS)
+        # ---- Track AI + User speech via conversation_item_added (v1.x primary event) ----
+        # Note: agent_speech_committed does NOT exist in v1.x — it was a v0.x event
+        @session.on("conversation_item_added")
+        def on_conversation_item(event):
+            try:
+                item = getattr(event, "item", event)
+                role = getattr(item, "role", None)
+                if role not in ("assistant", "agent"):
+                    return
+                # v1.4 ChatMessage has .text_content property that returns concatenated text
+                text = getattr(item, "text_content", None)
+                if not text:
+                    # Fallback: try content list
+                    content = getattr(item, "content", None)
+                    if isinstance(content, str) and content.strip():
+                        text = content.strip()
+                    elif isinstance(content, list):
+                        parts = []
+                        for cp in content:
+                            t = getattr(cp, "text", None) or (cp if isinstance(cp, str) else None)
+                            if t and isinstance(t, str):
+                                parts.append(t.strip())
+                        text = " ".join(parts) if parts else None
+                if text:
+                    _record_ai_response(text)
+                else:
+                    # Debug: log what attributes the item actually has so we can diagnose
+                    attrs = {a: type(getattr(item, a, None)).__name__ for a in dir(item) if not a.startswith('_')}
+                    print(f"[Event] conversation_item_added: assistant item with no text. Attrs: {attrs}", flush=True)
+            except Exception as e:
+                print(f"[Event] conversation_item_added error: {e}", flush=True)
+
+        # ---- Collect per-component metrics from SDK (STT, LLM, TTS) ----
         @session.on("metrics_collected")
         def on_metrics(event):
             try:
@@ -404,13 +450,12 @@ async def entrypoint(ctx: JobContext):
                 metric_type = type(metrics).__name__
 
                 if "STT" in metric_type:
-                    # New user turn — save previous turn if complete, start fresh
-                    if current_turn.get("stt_ms") is not None and current_turn.get("tts_first_chunk_ms") is not None:
+                    # New user turn — save previous turn if it was complete (had LLM+TTS)
+                    if current_turn.get("llm_first_token_ms") is not None:
                         turn_metrics_list.append(dict(current_turn))
                         current_turn.clear()
-                    elif current_turn.get("stt_ms") is not None:
-                        # Previous turn incomplete (no TTS yet), save what we have
-                        turn_metrics_list.append(dict(current_turn))
+                    elif current_turn:
+                        # Previous turn was STT-only (no LLM/TTS) — discard it
                         current_turn.clear()
 
                     stt_ms = (getattr(metrics, "duration", 0) or 0) * 1000
@@ -436,8 +481,14 @@ async def entrypoint(ctx: JobContext):
                     current_turn["tts_first_chunk_ms"] = round(ttfb, 1)
                     current_turn["tts_total_ms"] = round(tts_dur, 1)
 
-                    # Calculate time_to_first_audio = stt + llm_ttft + tts_ttfb
+                    # Use transcription_delay as effective STT latency when stt_ms is 0
+                    # (Deepgram streaming STT reports duration=0 since it processes incrementally)
                     stt = current_turn.get("stt_ms", 0)
+                    if stt == 0:
+                        stt = current_turn.get("transcription_delay_ms", 0)
+                        if stt > 0:
+                            current_turn["stt_ms"] = stt
+
                     llm_ttft = current_turn.get("llm_first_token_ms", 0)
                     current_turn["time_to_first_audio_ms"] = round(stt + llm_ttft + ttfb, 1)
                     current_turn["total_ms"] = round(stt + current_turn.get("llm_total_ms", 0) + tts_dur, 1)
@@ -450,10 +501,16 @@ async def entrypoint(ctx: JobContext):
                         current_turn["eou_delay_ms"] = round(eou_delay, 1)
                     if transcription_delay > 0:
                         current_turn["transcription_delay_ms"] = round(transcription_delay, 1)
+                        # Backfill stt_ms if it was 0 (streaming STT reports no duration)
+                        if current_turn.get("stt_ms", 0) == 0:
+                            current_turn["stt_ms"] = round(transcription_delay, 1)
                     print(f"[Metrics] EOU: delay={eou_delay:.0f}ms, transcription={transcription_delay:.0f}ms", flush=True)
 
+                elif "VAD" in metric_type:
+                    pass  # VAD metrics are noisy, suppress
+
                 else:
-                    print(f"[Metrics] Unknown: {metric_type}", flush=True)
+                    print(f"[Metrics] {metric_type}", flush=True)
 
             except Exception as e:
                 print(f"[Metrics] Error processing {type(getattr(event, 'metrics', event)).__name__}: {e}", flush=True)
@@ -491,43 +548,39 @@ async def entrypoint(ctx: JobContext):
             turn_metrics_list.append(dict(current_turn))
             current_turn.clear()
 
-        # Fallback: extract transcript from session's chat context if event handlers missed AI responses
+        # Fallback: extract transcript from session.history (v1.4 ChatContext)
         if session is not None:
             try:
-                chat_ctx = getattr(session, "chat_ctx", None)
-                if chat_ctx:
-                    items = getattr(chat_ctx, "items", None) or getattr(chat_ctx, "messages", None) or []
+                history = getattr(session, "history", None)
+                if history is not None:
+                    # .messages() returns only ChatMessage items (filters out function calls etc.)
+                    messages_fn = getattr(history, "messages", None)
+                    items = messages_fn() if callable(messages_fn) else (getattr(history, "items", None) or [])
                     session_transcript = []
-                    for item in items:
-                        role = getattr(item, "role", None)
+                    for msg in items:
+                        role = getattr(msg, "role", None)
                         if role == "system":
                             continue
-                        # Extract text from content (may be str or list of content parts)
-                        content = getattr(item, "content", None)
-                        text = None
-                        if isinstance(content, str) and content.strip():
-                            text = content.strip()
-                        elif isinstance(content, list):
-                            parts = []
-                            for cp in content:
-                                t = getattr(cp, "text", None) or getattr(cp, "content", None)
-                                if t and isinstance(t, str):
-                                    parts.append(t.strip())
-                            text = " ".join(parts) if parts else None
-                        if text:
+                        # v1.4 ChatMessage has .text_content property
+                        text = getattr(msg, "text_content", None)
+                        if not text:
+                            content = getattr(msg, "content", None)
+                            if isinstance(content, str) and content.strip():
+                                text = content.strip()
+                        if text and text.strip():
                             speaker = "AI" if role in ("assistant", "agent") else "User"
-                            session_transcript.append((speaker, text))
+                            session_transcript.append((speaker, text.strip()))
 
                     ai_from_events = sum(1 for t in transcript if t[0] == "AI")
                     ai_from_session = sum(1 for t in session_transcript if t[0] == "AI")
-                    print(f"[Agent] Transcript comparison: events={len(transcript)} ({ai_from_events} AI), chat_ctx={len(session_transcript)} ({ai_from_session} AI)", flush=True)
+                    print(f"[Agent] Transcript comparison: events={len(transcript)} ({ai_from_events} AI), history={len(session_transcript)} ({ai_from_session} AI)", flush=True)
 
-                    # Use session transcript if it captured more AI responses
+                    # Use session history if it captured more AI responses
                     if ai_from_session > ai_from_events and len(session_transcript) > 0:
-                        print(f"[Agent] Using chat_ctx transcript (has {ai_from_session} AI responses vs {ai_from_events} from events)", flush=True)
+                        print(f"[Agent] Using session.history transcript (has {ai_from_session} AI responses vs {ai_from_events} from events)", flush=True)
                         transcript = session_transcript
                 else:
-                    print("[Agent] No chat_ctx found on session", flush=True)
+                    print("[Agent] session.history not available", flush=True)
             except Exception as e:
                 print(f"[Agent] chat_ctx extraction failed: {e}", flush=True)
 
@@ -544,11 +597,13 @@ def _save_call_sync(call_id, call_start, transcript, turn_metrics_list):
     duration = (datetime.now() - call_start).total_seconds()
 
     # Build latency_metrics in Pipecat-compatible format from SDK metrics
+    # Filter out incomplete turns (STT-only with no LLM/TTS — not real conversational turns)
     latency_metrics = None
     avg_latency = None
-    if turn_metrics_list:
+    complete_turns = [tm for tm in turn_metrics_list if tm.get("llm_first_token_ms") is not None or tm.get("tts_first_chunk_ms") is not None]
+    if complete_turns:
         turns = []
-        for i, tm in enumerate(turn_metrics_list):
+        for i, tm in enumerate(complete_turns):
             turn_data = {"turn": i + 1}
             for key in ["stt_ms", "llm_first_token_ms", "llm_total_ms", "tts_first_chunk_ms",
                          "tts_total_ms", "time_to_first_audio_ms", "total_ms",
@@ -561,7 +616,7 @@ def _save_call_sync(call_id, call_start, transcript, turn_metrics_list):
         averages = {}
         for key in ["stt_ms", "llm_first_token_ms", "llm_total_ms", "tts_first_chunk_ms",
                      "tts_total_ms", "time_to_first_audio_ms", "total_ms"]:
-            values = [t.get(key) for t in turn_metrics_list if t.get(key) is not None]
+            values = [t.get(key) for t in complete_turns if t.get(key) is not None]
             if values:
                 averages[key] = round(sum(values) / len(values), 1)
 
@@ -574,9 +629,9 @@ def _save_call_sync(call_id, call_start, transcript, turn_metrics_list):
 
     print(f"\n{'='*50}", flush=True)
     print(f"CALL ENDED: {call_id}", flush=True)
-    print(f"Duration: {duration:.1f}s | Messages: {len(transcript)} | Turns: {len(turn_metrics_list)}", flush=True)
-    if turn_metrics_list:
-        for i, tm in enumerate(turn_metrics_list):
+    print(f"Duration: {duration:.1f}s | Messages: {len(transcript)} | Turns: {len(complete_turns)}", flush=True)
+    if complete_turns:
+        for i, tm in enumerate(complete_turns):
             parts = []
             if "stt_ms" in tm: parts.append(f"STT={tm['stt_ms']:.0f}ms")
             if "llm_first_token_ms" in tm: parts.append(f"LLM-TTFT={tm['llm_first_token_ms']:.0f}ms")
@@ -627,7 +682,7 @@ def create_app():
         return {
             "status": "ok",
             "service": "TechCorp Voice AI (LiveKit)",
-            "stt": "deepgram-nova-2",
+            "stt": "deepgram-nova-3",
             "tts": "deepgram-aura",
             "llm": "groq-llama-3.3-70b" if GROQ_API_KEY else "gpt-4o-mini",
             "sip_configured": bool(LIVEKIT_SIP_URI),
