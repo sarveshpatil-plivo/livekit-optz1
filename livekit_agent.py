@@ -269,10 +269,10 @@ async def schedule_callback(department: str, preferred_time: str = "as soon as p
 
 
 @llm.function_tool
-async def end_call() -> str:
+async def end_call(reason: str = "caller said goodbye") -> str:
     """End the phone call. Use this ONLY when the caller clearly wants to end the call — they said goodbye, bye, that's all, I'm done, etc. Say a brief farewell before calling this."""
     global _call_disconnect_event
-    print("[FUNCTION] end_call triggered", flush=True)
+    print(f"[FUNCTION] end_call triggered (reason: {reason})", flush=True)
     if _call_disconnect_event is not None:
         # Small delay so the farewell TTS can play first
         await asyncio.sleep(3)
@@ -307,6 +307,7 @@ ENDING CALLS:
 - When the caller says goodbye, bye, that's all, I'm done, etc.: Say "Thank you for calling TechCorp. Have a great day!" then call the end_call tool.
 - ALWAYS call end_call after saying goodbye. This hangs up the phone.
 - Do NOT call end_call for simple "thank you" or "thanks" — those are just acknowledgments, not goodbyes.
+- ALWAYS ask if the caller wants to end the call before calling end_call.
 
 IMPORTANT: NEVER say you can't help or don't have info without trying search_knowledge first. Always attempt the tool before falling back.""",
             tools=[search_knowledge, lookup_order, schedule_callback, end_call],
