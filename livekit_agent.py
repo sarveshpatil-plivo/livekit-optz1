@@ -326,9 +326,12 @@ async def entrypoint(ctx: JobContext):
     call_id = "unknown"
     call_start = datetime.now()
     transcript = []
-    latency_values = []
-    last_user_speech_time = [None]
     session = None  # keep reference for chat_ctx extraction in finally
+
+    # Per-component metrics collected from SDK's metrics_collected event
+    turn_metrics_list = []       # completed turns [{stt_ms, llm_first_token_ms, ...}]
+    current_turn = {}            # in-progress turn being built from metrics events
+    llm_provider_name = [None]   # track which LLM is in use
 
     # Disconnect event — shared with end_call tool
     disconnect_event = asyncio.Event()
@@ -351,6 +354,7 @@ async def entrypoint(ctx: JobContext):
                     model="llama-3.3-70b-versatile",
                     api_key=GROQ_API_KEY,
                 )
+                llm_provider_name[0] = "groq"
                 print("[Agent] LLM: Groq llama-3.3-70b-versatile (via with_groq)", flush=True)
             except (AttributeError, TypeError) as e:
                 print(f"[Agent] with_groq() not available ({e}), trying base_url...", flush=True)
@@ -360,12 +364,14 @@ async def entrypoint(ctx: JobContext):
                         base_url="https://api.groq.com/openai/v1",
                         api_key=GROQ_API_KEY,
                     )
+                    llm_provider_name[0] = "groq"
                     print("[Agent] LLM: Groq llama-3.3-70b-versatile (via base_url)", flush=True)
                 except Exception as e2:
                     print(f"[Agent] Groq base_url failed ({e2}), falling back to GPT-4o-mini", flush=True)
                     active_llm = None
         if active_llm is None:
             active_llm = openai.LLM(model="gpt-4o-mini")
+            llm_provider_name[0] = "openai"
             print("[Agent] LLM: GPT-4o-mini", flush=True)
 
         session = AgentSession(
@@ -375,7 +381,7 @@ async def entrypoint(ctx: JobContext):
             tts=deepgram.TTS(model="aura-asteria-en"),
         )
 
-        # Track user speech for latency measurement
+        # Track user speech transcripts
         @session.on("user_input_transcribed")
         def on_user(event):
             try:
@@ -383,90 +389,74 @@ async def entrypoint(ctx: JobContext):
                 is_final = getattr(event, "is_final", True)
                 if not is_final:
                     return
-
                 text = getattr(event, "transcript", None) or getattr(event, "text", None)
                 if text and isinstance(text, str) and text.strip():
-                    last_user_speech_time[0] = time.time()
                     print(f"[User] {text.strip()}", flush=True)
                     transcript.append(("User", text.strip()))
             except Exception as e:
                 print(f"[Event] user_input_transcribed error: {e}", flush=True)
 
-        # Helper: record AI response text + latency
-        def _record_ai_response(text, source="agent"):
-            if not text or not text.strip():
-                return False
-            text = text.strip()
-            # Deduplicate — skip if already in recent transcript
-            if any(t[1] == text for t in transcript[-5:] if t[0] == "AI"):
-                return False
-            if last_user_speech_time[0] is not None:
-                latency_ms = (time.time() - last_user_speech_time[0]) * 1000
-                latency_values.append(latency_ms)
-                print(f"[AI] {text}  (latency: {latency_ms:.0f}ms) [{source}]", flush=True)
-                last_user_speech_time[0] = None
-            else:
-                print(f"[AI] {text} [{source}]", flush=True)
-            transcript.append(("AI", text))
-            return True
-
-        # Helper: extract text from an event/item trying multiple attribute patterns
-        def _extract_text(obj):
-            # Direct string attributes
-            for attr in ["content", "text", "transcript", "message", "speech"]:
-                val = getattr(obj, attr, None)
-                if val and isinstance(val, str) and val.strip():
-                    return val.strip()
-            # Nested content list (e.g., list of ContentPart objects)
-            content = getattr(obj, "content", None)
-            if isinstance(content, list):
-                for cp in content:
-                    for attr in ["text", "content"]:
-                        t = getattr(cp, attr, None)
-                        if t and isinstance(t, str) and t.strip():
-                            return t.strip()
-            # Try .item sub-object
-            item = getattr(obj, "item", None)
-            if item and item is not obj:
-                return _extract_text(item)
-            return None
-
-        # Primary: agent_speech_committed
-        @session.on("agent_speech_committed")
-        def on_agent_speech(event):
+        # Collect per-component metrics from SDK (STT, LLM, TTS)
+        @session.on("metrics_collected")
+        def on_metrics(event):
             try:
-                text = _extract_text(event)
-                if text:
-                    _record_ai_response(text, source="speech_committed")
+                metrics = getattr(event, "metrics", event)
+                metric_type = type(metrics).__name__
+
+                if "STT" in metric_type:
+                    # New user turn — save previous turn if complete, start fresh
+                    if current_turn.get("stt_ms") is not None and current_turn.get("tts_first_chunk_ms") is not None:
+                        turn_metrics_list.append(dict(current_turn))
+                        current_turn.clear()
+                    elif current_turn.get("stt_ms") is not None:
+                        # Previous turn incomplete (no TTS yet), save what we have
+                        turn_metrics_list.append(dict(current_turn))
+                        current_turn.clear()
+
+                    stt_ms = (getattr(metrics, "duration", 0) or 0) * 1000
+                    current_turn["stt_ms"] = round(stt_ms, 1)
+                    print(f"[Metrics] STT: {stt_ms:.0f}ms", flush=True)
+
+                elif "LLM" in metric_type:
+                    ttft = (getattr(metrics, "ttft", 0) or 0) * 1000
+                    llm_dur = (getattr(metrics, "duration", 0) or 0) * 1000
+                    tokens_per_sec = getattr(metrics, "tokens_per_second", None)
+                    current_turn["llm_first_token_ms"] = round(ttft, 1)
+                    current_turn["llm_total_ms"] = round(llm_dur, 1)
+                    if tokens_per_sec:
+                        current_turn["tokens_per_second"] = round(tokens_per_sec, 1)
+                    # Track provider
+                    if llm_provider_name[0]:
+                        current_turn["llm_provider"] = llm_provider_name[0]
+                    print(f"[Metrics] LLM: TTFT={ttft:.0f}ms, total={llm_dur:.0f}ms", flush=True)
+
+                elif "TTS" in metric_type:
+                    ttfb = (getattr(metrics, "ttfb", 0) or 0) * 1000
+                    tts_dur = (getattr(metrics, "duration", 0) or 0) * 1000
+                    current_turn["tts_first_chunk_ms"] = round(ttfb, 1)
+                    current_turn["tts_total_ms"] = round(tts_dur, 1)
+
+                    # Calculate time_to_first_audio = stt + llm_ttft + tts_ttfb
+                    stt = current_turn.get("stt_ms", 0)
+                    llm_ttft = current_turn.get("llm_first_token_ms", 0)
+                    current_turn["time_to_first_audio_ms"] = round(stt + llm_ttft + ttfb, 1)
+                    current_turn["total_ms"] = round(stt + current_turn.get("llm_total_ms", 0) + tts_dur, 1)
+                    print(f"[Metrics] TTS: TTFB={ttfb:.0f}ms, total={tts_dur:.0f}ms | Turn TTFA={current_turn['time_to_first_audio_ms']:.0f}ms", flush=True)
+
+                elif "EOU" in metric_type:
+                    eou_delay = (getattr(metrics, "end_of_utterance_delay", 0) or 0) * 1000
+                    transcription_delay = (getattr(metrics, "transcription_delay", 0) or 0) * 1000
+                    if eou_delay > 0:
+                        current_turn["eou_delay_ms"] = round(eou_delay, 1)
+                    if transcription_delay > 0:
+                        current_turn["transcription_delay_ms"] = round(transcription_delay, 1)
+                    print(f"[Metrics] EOU: delay={eou_delay:.0f}ms, transcription={transcription_delay:.0f}ms", flush=True)
+
                 else:
-                    # Log full event structure for debugging
-                    attrs = {}
-                    for a in dir(event):
-                        if not a.startswith('_'):
-                            try:
-                                v = getattr(event, a)
-                                if not callable(v):
-                                    attrs[a] = f"{type(v).__name__}={repr(v)[:80]}"
-                            except:
-                                pass
-                    print(f"[DEBUG] agent_speech_committed no text: {type(event).__name__} {attrs}", flush=True)
-            except Exception as e:
-                print(f"[Event] agent_speech_committed error: {e}", flush=True)
+                    print(f"[Metrics] Unknown: {metric_type}", flush=True)
 
-        # Fallback: conversation_item_added
-        @session.on("conversation_item_added")
-        def on_conversation_item(event):
-            try:
-                item = getattr(event, "item", event)
-                role = getattr(item, "role", None)
-                # Accept both "assistant" and "agent" roles
-                if role not in ("assistant", "agent"):
-                    return
-                text = _extract_text(item)
-                if text:
-                    _record_ai_response(text, source="conv_item")
             except Exception as e:
-                print(f"[Event] conversation_item_added error: {e}", flush=True)
+                print(f"[Metrics] Error processing {type(getattr(event, 'metrics', event)).__name__}: {e}", flush=True)
 
         await session.start(agent=TechCorpReceptionist(), room=ctx.room)
         print("[Agent] Session started!", flush=True)
@@ -495,6 +485,11 @@ async def entrypoint(ctx: JobContext):
 
     finally:
         _call_disconnect_event = None
+
+        # Finalize any in-progress turn metrics
+        if current_turn:
+            turn_metrics_list.append(dict(current_turn))
+            current_turn.clear()
 
         # Fallback: extract transcript from session's chat context if event handlers missed AI responses
         if session is not None:
@@ -536,46 +531,62 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 print(f"[Agent] chat_ctx extraction failed: {e}", flush=True)
 
-        print(f"[Agent] Saving call data ({len(transcript)} messages, {len(latency_values)} latency samples)...", flush=True)
-        _save_call_sync(call_id, call_start, transcript, latency_values)
+        print(f"[Agent] Saving call data ({len(transcript)} messages, {len(turn_metrics_list)} turns with metrics)...", flush=True)
+        _save_call_sync(call_id, call_start, transcript, turn_metrics_list)
 
 
-def _save_call_sync(call_id, call_start, transcript, latency_values):
+def _save_call_sync(call_id, call_start, transcript, turn_metrics_list):
     """Save call data synchronously — guaranteed to complete before process exits."""
     if not transcript:
         print("[Agent] No transcript to save", flush=True)
         return
 
-    avg_latency = round(sum(latency_values) / len(latency_values), 1) if latency_values else None
     duration = (datetime.now() - call_start).total_seconds()
 
-    # Build per-turn latency_metrics (similar to Pipecat format)
+    # Build latency_metrics in Pipecat-compatible format from SDK metrics
     latency_metrics = None
-    if latency_values:
+    avg_latency = None
+    if turn_metrics_list:
         turns = []
-        for i, lat in enumerate(latency_values):
-            turns.append({
-                "turn": i + 1,
-                "total_ms": round(lat, 1),
-                "time_to_first_audio_ms": round(lat, 1),  # best approximation with LiveKit SDK
-            })
+        for i, tm in enumerate(turn_metrics_list):
+            turn_data = {"turn": i + 1}
+            for key in ["stt_ms", "llm_first_token_ms", "llm_total_ms", "tts_first_chunk_ms",
+                         "tts_total_ms", "time_to_first_audio_ms", "total_ms",
+                         "llm_provider", "tokens_per_second", "eou_delay_ms", "transcription_delay_ms"]:
+                if key in tm:
+                    turn_data[key] = tm[key]
+            turns.append(turn_data)
+
+        # Compute averages for numeric fields
+        averages = {}
+        for key in ["stt_ms", "llm_first_token_ms", "llm_total_ms", "tts_first_chunk_ms",
+                     "tts_total_ms", "time_to_first_audio_ms", "total_ms"]:
+            values = [t.get(key) for t in turn_metrics_list if t.get(key) is not None]
+            if values:
+                averages[key] = round(sum(values) / len(values), 1)
+
         latency_metrics = {
             "turns": turns,
-            "averages": {
-                "total_ms": round(sum(latency_values) / len(latency_values), 1),
-                "time_to_first_audio_ms": round(sum(latency_values) / len(latency_values), 1),
-            },
-            "total_turns": len(latency_values),
-            "note": "LiveKit SDK abstracts STT/LLM/TTS pipeline; total_ms = time from user speech end to AI speech start"
+            "averages": averages,
+            "total_turns": len(turns),
         }
+        avg_latency = averages.get("time_to_first_audio_ms") or averages.get("total_ms")
 
     print(f"\n{'='*50}", flush=True)
     print(f"CALL ENDED: {call_id}", flush=True)
-    print(f"Duration: {duration:.1f}s | Messages: {len(transcript)}", flush=True)
-    if avg_latency:
-        print(f"Avg latency: {avg_latency}ms", flush=True)
-        for i, lat in enumerate(latency_values):
-            print(f"  Turn {i+1}: {lat:.0f}ms", flush=True)
+    print(f"Duration: {duration:.1f}s | Messages: {len(transcript)} | Turns: {len(turn_metrics_list)}", flush=True)
+    if turn_metrics_list:
+        for i, tm in enumerate(turn_metrics_list):
+            parts = []
+            if "stt_ms" in tm: parts.append(f"STT={tm['stt_ms']:.0f}ms")
+            if "llm_first_token_ms" in tm: parts.append(f"LLM-TTFT={tm['llm_first_token_ms']:.0f}ms")
+            if "llm_total_ms" in tm: parts.append(f"LLM={tm['llm_total_ms']:.0f}ms")
+            if "tts_first_chunk_ms" in tm: parts.append(f"TTS-TTFB={tm['tts_first_chunk_ms']:.0f}ms")
+            if "tts_total_ms" in tm: parts.append(f"TTS={tm['tts_total_ms']:.0f}ms")
+            if "time_to_first_audio_ms" in tm: parts.append(f"TTFA={tm['time_to_first_audio_ms']:.0f}ms")
+            print(f"  Turn {i+1}: {' | '.join(parts)}", flush=True)
+        if avg_latency:
+            print(f"  Avg TTFA: {avg_latency:.0f}ms", flush=True)
 
     # Generate summary synchronously using openai SDK
     summary = "Call ended before summary could be generated."
